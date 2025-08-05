@@ -17,6 +17,7 @@ from models.TblTicketFollower import TblTicketFollower
 
 
 from controllers.UserController import user_controller
+from controllers.CategoryController import category_controller
 
 
 
@@ -36,6 +37,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 
 app.register_blueprint(user_controller,url_prefix='/User')
+app.register_blueprint(category_controller,url_prefix='/Category')
 
 
 
