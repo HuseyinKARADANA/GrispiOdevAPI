@@ -414,3 +414,128 @@ def upload_message_attachment(message_id):
     except Exception as e:
         print('upload_att err:', e)
         return jsonify({'error':'Sunucu hatası'}), 500
+
+
+@ticket_controller.route('/all-open', methods=['GET'])
+@token_required
+def list_all_open_or_unassigned():
+    """
+    Şifreli status ile SQL tarafında filtre:
+      - t.status = <cipher>  (örn: OPEN'in şifreli hali)
+      - VEYA assigned_user_id IS NULL (teknisyen atanmamış)
+    ?page, ?per_page, ?status_cipher opsiyonel (default: "YdPyZm12BB5UEIiNRTrTcA==")
+    """
+    try:
+        page = max(int(request.args.get('page', 1)), 1)
+        per_page = max(int(request.args.get('per_page', 10)), 1)
+        offset = (page - 1) * per_page
+
+        # default cipher
+        status_cipher = AESService.encrypt("OPEN")
+
+        with pyodbc.connect(CONNECTION_STRING) as conn:
+            cur = conn.cursor()
+
+            # toplam adet
+            cur.execute("""
+                SELECT COUNT(*) 
+                FROM TblTicket
+                WHERE (status = ? OR assigned_user_id IS NULL)
+            """, (status_cipher,))
+            total_items = cur.fetchone()[0]
+
+            # sayfalı kayıtlar
+            cur.execute("""
+                SELECT 
+                    t.TicketId, t.user_id, t.assigned_user_id,
+                    t.subject, t.category_id, t.priority, t.status,
+                    t.update_date, t.created_date,
+                    ru.name AS requester_name, ru.surname AS requester_surname,
+                    au.name AS assignee_name, au.surname AS assignee_surname,
+                    c.category_name
+                FROM TblTicket t
+                LEFT JOIN TblUser ru ON ru.id = t.user_id
+                LEFT JOIN TblUser au ON au.id = t.assigned_user_id
+                LEFT JOIN TblCategory c ON c.id = t.category_id
+                WHERE (t.status = ? OR t.assigned_user_id IS NULL)
+                ORDER BY t.created_date DESC
+                OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+            """, (status_cipher, offset, per_page))
+            rows = cur.fetchall()
+
+        data = []
+        for r in rows:
+            # şifreli alanları çöz
+            dec_subject  = AESService.decrypt(r.subject)  if r.subject  else None
+            dec_priority = AESService.decrypt(r.priority) if r.priority else None
+            dec_status   = AESService.decrypt(r.status)   if r.status   else None
+
+            item = {
+                'ticket_id': r.TicketId,
+                'subject': dec_subject,
+                'category_id': r.category_id,
+                'category_name': r.category_name,
+                'priority': dec_priority.upper() if dec_priority else None,
+                'status': dec_status.upper() if dec_status else None,
+                'requester': {
+                    'id': r.user_id,
+                    'name': AESService.decrypt(r.requester_name),
+                    'surname': AESService.decrypt(r.requester_surname)
+                },
+                'assignee': None if r.assigned_user_id is None else {
+                    'id': r.assigned_user_id,
+                    'name': AESService.decrypt(r.assignee_name),
+                    'surname': AESService.decrypt(r.assignee_surname)
+                },
+                'update_date': r.update_date,
+                'created_date': r.created_date
+            }
+            data.append(item)
+
+        return jsonify({
+            'data': data,
+            'pagination': {
+                'total_items': total_items,
+                'page': page,
+                'per_page': per_page,
+                'total_pages': (total_items + per_page - 1) // per_page
+            }
+        }), 200
+
+    except Exception as e:
+        print("all-open err:", e)
+        return jsonify({'error': 'Sunucu hatası'}), 500
+
+
+@ticket_controller.route('/<int:ticket_id>/assign', methods=['POST'])
+@token_required
+def assign_ticket(ticket_id):
+    """
+    Ticket'a teknisyen (assigned_user_id) atar.
+    Body: { "assigned_user_id": 5 }
+    """
+    try:
+
+        assigned_user_id = request.user_id
+
+        if assigned_user_id is None:
+            return jsonify({"error": "assigned_user_id zorunludur"}), 400
+
+        with pyodbc.connect(CONNECTION_STRING) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE TblTicket
+                SET assigned_user_id = ?, update_date = GETDATE()
+                WHERE TicketId = ?
+            """, (assigned_user_id, ticket_id))
+            conn.commit()
+
+        return jsonify({
+            "message": "Ticket başarıyla atandı",
+            "ticket_id": ticket_id,
+            "assigned_user_id": assigned_user_id
+        }), 200
+
+    except Exception as e:
+        print("assign_ticket err:", e)
+        return jsonify({"error": "Sunucu hatası"}), 500
