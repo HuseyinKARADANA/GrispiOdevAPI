@@ -145,3 +145,62 @@ def login():
         print(f"🚨 Genel Hata: {e}")
         return jsonify({"error": "Dahili Sunucu Hatası"}), 500
 
+
+@user_controller.route('/profile', methods=['GET'])
+@token_required
+def get_user_profile():
+    try:
+        user_id = request.user_id
+
+        with pyodbc.connect(CONNECTION_STRING) as conn:
+            cursor = conn.cursor()
+
+            # Kullanıcı bilgilerini çek
+            cursor.execute("""
+                SELECT name, surname, preliminary_phone, preliminary_email, website, profile_img, role
+                FROM TblUser
+                WHERE id = ? AND is_active = 1
+            """, (user_id,))
+            user_row = cursor.fetchone()
+
+            if not user_row:
+                return jsonify({'error': 'Kullanıcı bulunamadı'}), 404
+
+            # Adres bilgilerini çek
+            cursor.execute("""
+                SELECT country, city, address_line, postal_code
+                FROM TblAddress
+                WHERE user_id = ? AND is_active = 1
+            """, (user_id,))
+            address_row = cursor.fetchone()
+
+            # AES ile çöz
+            profile_data = {
+                "name": AESService.decrypt(user_row.name),
+                "surname": AESService.decrypt(user_row.surname),
+                "preliminary_phone": AESService.decrypt(user_row.preliminary_phone),
+                "preliminary_email": AESService.decrypt(user_row.preliminary_email),
+                "website": AESService.decrypt(user_row.website) if user_row.website else "",
+                "profile_img": AESService.decrypt(user_row.profile_img) if user_row.profile_img else "",
+                "role": AESService.decrypt(user_row.role)
+            }
+
+            if address_row:
+                profile_data["address"] = {
+                    "country": AESService.decrypt(address_row.country),
+                    "city": AESService.decrypt(address_row.city),
+                    "address_line": AESService.decrypt(address_row.address_line),
+                    "postal_code": AESService.decrypt(address_row.postal_code)
+                }
+            else:
+                profile_data["address"] = {
+                    "country": "",
+                    "city": "",
+                    "address_line": "",
+                    "postal_code": ""
+                }
+
+            return jsonify(profile_data), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

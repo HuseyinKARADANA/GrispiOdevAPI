@@ -18,6 +18,7 @@ from models.TblTicketFollower import TblTicketFollower
 
 from controllers.UserController import user_controller
 from controllers.CategoryController import category_controller
+from controllers.TicketController import ticket_controller
 
 
 
@@ -38,6 +39,7 @@ db.init_app(app)
 
 app.register_blueprint(user_controller,url_prefix='/User')
 app.register_blueprint(category_controller,url_prefix='/Category')
+app.register_blueprint(ticket_controller,url_prefix='/Ticket')
 
 
 
