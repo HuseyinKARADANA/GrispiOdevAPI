@@ -19,3 +19,4 @@ class TblUser(db.Model):
 
     created_at = db.Column(db.DateTime, default=db.func.current_timestamp())
     is_active = db.Column(db.Boolean, default=True, nullable=False)
+    grispiId=db.Column(db.Integer, nullable=True)

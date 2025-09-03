@@ -24,6 +24,7 @@ def token_required(f):
             data = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
             request.user = data  # Tüm user data'sını set et
             request.user_id = data['id']  # ID'yi de ayrıca set et
+            request.grispi_id = data['grispi_id']  # ID'yi de ayrıca set et
         except jwt.ExpiredSignatureError:
             return jsonify({'error': 'Token süresi dolmuş!'}), 401
         except jwt.InvalidTokenError:

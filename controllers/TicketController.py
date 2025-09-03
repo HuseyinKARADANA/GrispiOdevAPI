@@ -1,13 +1,14 @@
 from flask import Blueprint, request, jsonify
 from service.auth import token_required
 from service.aes_service import AESService
-import pyodbc
-import os
 from datetime import datetime
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 import uuid
-
+import os, requests, pyodbc, math, datetime
+from flask import jsonify, request
+# ticket_controller.py (üst kısım)
+from service.mailer import send_ticket_opened_email
 load_dotenv()
 
 ticket_controller = Blueprint('ticket_controller', __name__)
@@ -16,16 +17,94 @@ CONNECTION_STRING = os.getenv("CONNECTION_STRING")
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'docx', 'xlsx'}
 
+
+GRISPI_TOKEN  = os.getenv("GRISPI_TOKEN")
+GRISPI_TENANT = os.getenv("GRISPI_TENANT", "stajer")
+GRISPI_BASE   = "https://api.grispi.com/public/v1"
+
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def to_e164_tr(raw):
+    if not raw: return None
+    s = str(raw).strip().replace(" ", "")
+    if s.startswith("+90"): return s
+    if s.startswith("90"):  return f"+{s}"
+    if s.startswith("0"):   return f"+90{s[1:]}"
+    if len(s) == 10 and s.isdigit(): return f"+90{s}"
+    return s
 
+
+
+
+def _ms_to_date(ms):
+    try:
+        return datetime.datetime.utcfromtimestamp(int(ms)/1000.0)
+    except Exception:
+        return None
+
+def _safe_field(field_map, key, subkey="userFriendlyValue"):
+    try:
+        fm = field_map.get(key) or {}
+        # priority/status gibi alanlarda userFriendlyValue; subject'te hem value hem userFriendlyValue olabilir
+        return fm.get(subkey) or fm.get("value") or fm.get("serializedValue")
+    except Exception:
+        return None
+
+def _get_grispi_user_id_from_token_or_lookup(user_id: int):
+    """
+    token_required içinde request.grispi_id veya request.jwt_payload['grispi_id'] varsa onu kullan.
+    Yoksa DB’den email’i decrypt edip Grispi search ile id bul.
+    """
+    grispi_id = getattr(request, "grispi_id", None)
+    if not grispi_id:
+        jwt_payload = getattr(request, "jwt_payload", {}) or {}
+        grispi_id = jwt_payload.get("grispi_id")
+
+    if grispi_id:
+        return grispi_id
+
+    # Fallback: DB'den email'i çöz, Grispi’de search et
+    with pyodbc.connect(CONNECTION_STRING) as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT preliminary_email
+            FROM TblUser WHERE id = ?
+        """, (user_id,))
+        row = c.fetchone()
+    if not row:
+        return None
+
+    enc_email = row[0]
+    email = AESService.decrypt(enc_email) if enc_email else None
+    if not email:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {GRISPI_TOKEN}",
+        "tenantId": GRISPI_TENANT,
+        "Content-Type": "application/json",
+    }
+    try:
+        r = requests.get(f"{GRISPI_BASE}/customers/search",
+                         headers=headers,
+                         params={"searchTerm": email, "size": 1, "page": 0},
+                         timeout=12)
+        if r.status_code == 200 and r.json().get("content"):
+            return r.json()["content"][0]["id"]
+    except Exception as ex:
+        print("⚠️ Grispi search hata:", ex)
+    return None
 @ticket_controller.route('/create', methods=['POST'])
 @token_required
 def create_ticket():
+    """
+    Ticket oluşturur; lokal DB'ye kaydeder, Grispi'ye POST eder.
+    Başarılı/başarısız her iki senaryoda da kullanıcıya 'talep alındı' maili atmayı dener.
+    """
     try:
         subject = request.form.get('subject')
         category_id = request.form.get('category_id')
@@ -36,13 +115,24 @@ def create_ticket():
         if not subject or not category_id or not priority:
             return jsonify({'error': 'Zorunlu alanlar eksik'}), 400
 
-        created_date = datetime.now()
+        created_date = datetime.datetime.now()
         user_id = request.user_id
         assigned_user_id = None
         status = "OPEN"
         update_date = created_date
 
-        # AES ile şifreleme
+        # --- Kullanıcı email/telefonu (mail + Grispi creator için) ---
+        with pyodbc.connect(CONNECTION_STRING) as conn_lookup:
+            c2 = conn_lookup.cursor()
+            c2.execute("""
+                SELECT preliminary_email, preliminary_phone
+                FROM TblUser WHERE id = ?
+            """, (user_id,))
+            row = c2.fetchone()
+        user_email = AESService.decrypt(row[0]) if row and row[0] else None
+        user_phone = AESService.decrypt(row[1]) if row and row[1] else None
+
+        # --- Lokal DB kaydı ---
         enc_subject = AESService.encrypt(subject)
         enc_description = AESService.encrypt(description) if description else None
         enc_priority = AESService.encrypt(priority)
@@ -50,8 +140,6 @@ def create_ticket():
 
         with pyodbc.connect(CONNECTION_STRING) as conn:
             cursor = conn.cursor()
-
-            # Ticket oluştur
             cursor.execute("""
                 INSERT INTO TblTicket (
                     user_id, assigned_user_id, subject, category_id, 
@@ -60,20 +148,12 @@ def create_ticket():
                 OUTPUT INSERTED.TicketId
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                user_id,
-                assigned_user_id,
-                enc_subject,
-                category_id,
-                enc_description,
-                enc_priority,
-                enc_status,
-                update_date,
-                created_date
+                user_id, assigned_user_id, enc_subject, category_id,
+                enc_description, enc_priority, enc_status, update_date, created_date
             ))
-
             ticket_id = cursor.fetchone()[0]
 
-            # Dosyaları işle
+            # Dosyaları lokalde sakla
             for file in files:
                 if file and allowed_file(file.filename):
                     filename = secure_filename(file.filename)
@@ -83,7 +163,6 @@ def create_ticket():
 
                     enc_filename = AESService.encrypt(filename)
                     enc_filepath = AESService.encrypt(filepath)
-
                     cursor.execute("""
                         INSERT INTO TblFolder (ticket_id, file_name, file_path, created_at)
                         VALUES (?, ?, ?, ?)
@@ -91,7 +170,84 @@ def create_ticket():
 
             conn.commit()
 
-        return jsonify({'message': 'Destek talebi başarıyla oluşturuldu', 'ticket_id': ticket_id}), 201
+        # --- İç helper: mail gönder (best-effort) ---
+        def _notify_open(ticket_no: str):
+            try:
+                if os.getenv("EMAIL_ENABLED", "true").lower() in ("1", "true", "yes") and user_email:
+                    sent = send_ticket_opened_email(user_email, ticket_no=ticket_no, title=subject)
+                    print(f"📧 ticket_opened mail -> {user_email} | sent={sent} | ticket_no={ticket_no}")
+                else:
+                    print("📧 mail atlanıyor: EMAIL_ENABLED=false veya user_email boş")
+            except Exception as e:
+                print(f"📧 Talep açılış maili gönderilemedi: {e}")
+
+        # --- Grispi'de ticket oluştur ---
+        grispi_headers = {
+            "Authorization": f"Bearer {GRISPI_TOKEN}",
+            "tenantId": GRISPI_TENANT,
+            "Content-Type": "application/json"
+        }
+        body_text = description if (description and description.strip()) else subject
+        creator = []
+        if user_email:
+            creator.append({"key": "us.email", "value": user_email})
+        if user_phone:
+            creator.append({"key": "us.phone", "value": to_e164_tr(user_phone)})
+
+        grispi_payload = {
+            "comment": {
+                "body": body_text,
+                "publicVisible": False,
+                "creator": creator
+            },
+            "fields": [
+                {"key": "ts.subject", "value": subject}
+            ]
+        }
+
+        grispi_ticket_key = None
+        try:
+            g_resp = requests.post(
+                f"{GRISPI_BASE}/tickets",
+                headers=grispi_headers,
+                json=grispi_payload,
+                timeout=20
+            )
+            print("🎫 Grispi ticket POST status:", g_resp.status_code)
+            print("🎫 Grispi ticket response:", g_resp.text)
+
+            if g_resp.status_code in (200, 201):
+                gjson = g_resp.json()
+                grispi_ticket_key = gjson.get("key") or gjson.get("id")
+
+                # -- Mail: Grispi + lokal başarılı
+                _notify_open(str(grispi_ticket_key or ticket_id))
+
+                return jsonify({
+                    'message': 'Destek talebi başarıyla oluşturuldu',
+                    'ticket_id': ticket_id,
+                    'grispi_ticket_key': grispi_ticket_key
+                }), 201
+            else:
+                # -- Mail: Grispi başarısız, ama lokal var
+                _notify_open(str(ticket_id))
+
+                return jsonify({
+                    'message': 'Destek talebi oluşturuldu (lokal). Grispi oluşturulamadı.',
+                    'ticket_id': ticket_id,
+                    'grispi_error': g_resp.text
+                }), 201
+
+        except Exception as ex:
+            print("⚠️ Grispi ticket create isteği başarısız:", ex)
+
+            # -- Mail: Ağ/servis hatası; lokal var
+            _notify_open(str(ticket_id))
+
+            return jsonify({
+                'message': 'Destek talebi oluşturuldu (lokal). Grispi bağlantısı başarısız.',
+                'ticket_id': ticket_id
+            }), 201
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -101,61 +257,75 @@ def create_ticket():
 @token_required
 def get_tickets_by_user():
     try:
-        user_id = request.user_id
+        # Auth'lu kullanıcı (sen zaten token_required ile set ediyorsun)
+        grispi_user_id  = request.grispi_id
+        print(grispi_user_id)
+        # İstemci sayfalaması
+        page = max(int(request.args.get('page', 1)), 1)
+        per_page = max(int(request.args.get('per_page', 10)), 1)
+        start = (page - 1) * per_page
+        end   = start + per_page
 
-        # Sayfa ve limit parametreleri
-        page = int(request.args.get('page', 1))
-        per_page = int(request.args.get('per_page', 10))
-        offset = (page - 1) * per_page
 
-        with pyodbc.connect(CONNECTION_STRING) as conn:
-            cursor = conn.cursor()
-
-            # Toplam kayıt sayısı
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM TblTicket
-                WHERE user_id = ?
-            """, (user_id,))
-            total_count = cursor.fetchone()[0]
-
-            # Sayfalı veri çekimi
-            cursor.execute("""
-                SELECT TicketId, subject, category_id, priority, status, update_date, created_date
-                FROM TblTicket
-                WHERE user_id = ?
-                ORDER BY created_date DESC
-                OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
-            """, (user_id, offset, per_page))
-
-            rows = cursor.fetchall()
-            result = []
-
-            for row in rows:
-                result.append({
-                    'ticket_id': f"#{row.TicketId}",
-                    'subject': AESService.decrypt(row.subject),
-                    'priority': AESService.decrypt(row.priority).upper(),
-                    'status': AESService.decrypt(row.status).upper(),
-                    'category': f"category{row.category_id}",
-                    'update_date': row.update_date.strftime('%d.%m.%Y') if row.update_date else None,
-                    'created_date': row.created_date.strftime('%d.%m.%Y') if row.created_date else None
-                })
-
-        response = {
-            'data': result,
-            'pagination': {
-                'total_items': total_count,
-                'page': page,
-                'per_page': per_page,
-                'total_pages': (total_count + per_page - 1) // per_page
-            }
+        # 2) Grispi’den talepleri çek
+        headers = {
+            "Authorization": f"Bearer {GRISPI_TOKEN}",
+            "tenantId": GRISPI_TENANT,
+            "Content-Type": "application/json"
         }
+        resp = requests.get(f"{GRISPI_BASE}/users/{grispi_user_id}/tickets",
+                            headers=headers, timeout=20)
 
-        return jsonify(response), 200
+        if resp.status_code != 200:
+            return jsonify({
+                "error": "Grispi isteği başarısız",
+                "details": resp.text
+            }), 502
+
+        tickets = resp.json() if isinstance(resp.json(), list) else resp.json().get("content", [])
+        # Not: Swagger “en fazla 100 açık talep” diyor; kapalıları dönmüyorsa bu beklenen davranış.
+
+        # 3) Dönüşleri bizim şemaya map et
+        mapped = []
+        for t in tickets:
+            # Bazı alanlar response kökünde, bazıları fieldMap içinde
+            key = t.get("key")  # örn: TICKET-1
+            createdAt = _ms_to_date(t.get("createdAt"))
+            updatedAt = _ms_to_date(t.get("updatedAt"))
+
+            field_map = t.get("fieldMap") or {}
+
+            subject  = _safe_field(field_map, "ts.subject") or t.get("subject")
+            status   = _safe_field(field_map, "ts.status") or ""
+            priority = _safe_field(field_map, "ts.priority") or ""
+
+            mapped.append({
+                "ticket_id": key or "",  # senin eski UI’da #123 gibi gösteriyordun, burada key daha anlamlı
+                "subject": subject or "",
+                "priority": str(priority).upper() if priority else "",
+                "status": str(status).upper() if status else "",
+                "category": None,  # Grispi tarafında kategori alanı ayrıysa buraya map edebilirsin
+                "update_date": updatedAt.strftime('%d.%m.%Y') if updatedAt else None,
+                "created_date": createdAt.strftime('%d.%m.%Y') if createdAt else None
+            })
+
+        total_count = len(mapped)
+        paged = mapped[start:end]
+        total_pages = math.ceil(total_count / per_page) if per_page else 1
+
+        return jsonify({
+            "data": paged,
+            "pagination": {
+                "total_items": total_count,
+                "page": page,
+                "per_page": per_page,
+                "total_pages": total_pages
+            }
+        }), 200
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 
 @ticket_controller.route('/<int:ticket_id>/detail', methods=['GET'])
