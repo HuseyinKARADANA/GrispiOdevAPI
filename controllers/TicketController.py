@@ -273,8 +273,25 @@ def get_tickets_by_user():
             "tenantId": GRISPI_TENANT,
             "Content-Type": "application/json"
         }
-        resp = requests.get(f"{GRISPI_BASE}/users/{grispi_user_id}/tickets",
-                            headers=headers, timeout=20)
+        resp = requests.get(
+            f"{GRISPI_BASE}/users/{grispi_user_id}/tickets",
+            headers=headers,
+            timeout=20
+        )
+
+        # --- DEBUG LOG ---
+        print("🔹 Grispi status code:", resp.status_code)
+        try:
+            print("🔹 Grispi response JSON:", resp.json())
+        except Exception:
+            print("🔹 Grispi raw text:", resp.text)
+        # -----------------
+
+        if resp.status_code != 200:
+            return jsonify({
+                "error": "Grispi isteği başarısız",
+                "details": resp.text
+            }), 502
 
         if resp.status_code != 200:
             return jsonify({
